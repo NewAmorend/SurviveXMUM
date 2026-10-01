@@ -1,0 +1,149 @@
+# AI 代码评审：
+#   - PR 打开或更新时，把变更 diff 交给大模型做初审，结论以评论贴在 PR 上。
+#   - 同一个 PR 只保留一条 AI 评论（带标记），每次更新原位刷新，不刷屏。
+#   - 只做辅助参考：意见由 AI 生成，合并决策仍以人工审查为准。
+#
+# 仓库 Secrets 里需要配置：
+#   AI_API_KEY   大模型服务的 API Key（未配置时本流水线自动跳过，不报错）
+#
+# 可选的仓库 Variables（不设则用默认值）：
+#   AI_BASE_URL  OpenAI 兼容接口地址，默认 https://open.bigmodel.cn/api/paas/v4（智谱开放平台）
+#   AI_MODEL     模型名，默认 glm-4.5-flash
+#   换供应商只要这两项一起换（如 DeepSeek / Moonshot / OpenAI 等兼容接口均可）。
+name: AI Review
+
+on:
+  pull_request:
+    branches: [main, dev]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# 同一 PR 推新提交时，取消还在跑的上一轮评审
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: AI review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - id: guard
+        name: Check AI_API_KEY
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+        run: |
+          if [ -z "$AI_API_KEY" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::仓库未配置 AI_API_KEY，跳过 AI 评审。配置方法见 .github/workflows/ai-review.yml 头部注释。"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.configured == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Review the diff
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ vars.AI_BASE_URL }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+
+          BASE_URL="${AI_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}"
+          MODEL="${AI_MODEL:-glm-4.5-flash}"
+          MARKER='<!-- ai-review-comment -->'
+          BASE_SHA='${{ github.event.pull_request.base.sha }}'
+
+          # 变更统计 + diff（排除锁文件与构建产物；diff 太长就截断）
+          STAT=$(git diff --stat "$BASE_SHA...HEAD" | tail -1)
+          DIFF=$(git diff --unified=2 "$BASE_SHA...HEAD" \
+            -- . ':(exclude)*package-lock.json' ':(exclude)*.min.*' ':(exclude)dist/*')
+          if [ -z "$DIFF" ]; then
+            echo "没有可评审的 diff，跳过。"
+            exit 0
+          fi
+          if [ "${#DIFF}" -gt 60000 ]; then
+            DIFF="${DIFF:0:60000}
+
+          ……（diff 过长，已截断，请人工查看完整变更）"
+          fi
+
+          SYSTEM='你是这个学生开源项目（Vue 3 前端 + Spring Boot 后端的校园 wiki）的资深代码审查员。只报告有实际影响的问题：正确性 bug、安全漏洞（XSS / 注入 / 越权 / 敏感信息泄漏 / 依赖风险）、明显的性能问题、破坏性变更、与项目现有约定冲突的写法。不要评论纯格式或风格偏好，不要夸奖，不要复述 diff。用中文 Markdown 输出：每条问题一小节，给出 `文件:行号`、问题一句话说明、修复建议一句话；若确实没有值得报告的问题，只输出「未发现明显问题」。'
+
+          jq -n \
+            --arg sys "$SYSTEM" \
+            --arg user "PR 标题：$PR_TITLE
+          PR 描述：${PR_BODY:-(无)}
+
+          变更统计：$STAT
+
+          \`\`\`diff
+          $DIFF
+          \`\`\`" \
+            --arg model "$MODEL" \
+            '{
+              model: $model,
+              messages: [
+                { role: "system", content: $sys },
+                { role: "user",   content: $user }
+              ],
+              temperature: 0.2,
+              max_tokens: 2048
+            }' > payload.json
+
+          HTTP=$(curl -sS -w '\n%{http_code}' "$BASE_URL/chat/completions" \
+            -H "Authorization: Bearer $AI_API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d @payload.json)
+          BODY=$(printf '%s' "$HTTP" | sed '$d')
+          CODE=$(printf '%s' "$HTTP" | tail -1)
+          if [ "$CODE" != "200" ]; then
+            echo "::error::模型接口返回 HTTP $CODE"
+            printf '%s' "$BODY" | head -c 2000
+            exit 1
+          fi
+
+          REVIEW=$(printf '%s' "$BODY" | jq -r '.choices[0].message.content // empty')
+          if [ -z "$REVIEW" ]; then
+            echo "::error::模型返回内容为空"
+            printf '%s' "$BODY" | head -c 2000
+            exit 1
+          fi
+
+          COMMENT="$REVIEW
+
+          ---
+          <sub>AI 初审（$MODEL），仅供参考；合并决策请以人工审查为准。$MARKER</sub>"
+
+          # 同一 PR 只保留一条 AI 评论：有标记的旧评论原位更新，否则新建
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -1)
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$EXISTING" -f body="$COMMENT" >/dev/null
+            echo "已更新既有 AI 评论 #$EXISTING"
+          else
+            gh pr comment "$PR_NUMBER" --body "$COMMENT" >/dev/null
+            echo "已发布新 AI 评论"
+          fi
+
+          # 同时写进流水线摘要，Action 页面直接可读
+          {
+            echo "## AI Review"
+            echo "$REVIEW"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          rm -f payload.json
